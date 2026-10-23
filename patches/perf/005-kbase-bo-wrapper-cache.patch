@@ -1,0 +1,205 @@
+From: panvk-kbase-android worker <panvk-worker@localhost>
+Subject: [PATCH perf 005] kbase: cache the kbase_kmod_bo wrapper structs
+
+Every pan_kmod_bo_alloc()/alloc_dmabuf()/import() allocated a
+kbase_kmod_bo through the device allocator, and every final pan_kmod_bo_put()
+freed it again. BOs come and go constantly (command buffers, descriptor
+pools, transient images), so the wrapper struct is a per-BO allocator round
+trip that buys nothing.
+
+Keep up to KBASE_BO_CACHE_MAX free wrappers per device in a list and reuse
+them. Only the host-side struct is pooled: the GPU memory itself is still
+allocated/imported and freed through the kernel on every create/destroy, so
+the driver's memory semantics, including the kernel's deferred reclaim of
+GPU pages, are untouched. kbase_kmod_bo_wrapper_alloc() zeroes a reused
+wrapper (the previous BO's fields must not leak into the new one).
+
+Purpose: remove one allocator alloc/free pair per BO.
+Tested GPU: build only, not yet run on device.
+Tested Kbase UAPI: CSF 1.21, JM 11.x.
+Mesa base range: 26.3.0-devel (pinned 5a07217f).
+Dependencies: perf/004 (same file).
+Validation test: TBD, on-device render smoke test.
+
+Generated-by: LLM
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 1b77190..1398d21 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -227,6 +227,13 @@ struct kbase_kmod_dev {
+     * (kbase_kmod_jm_clean_imports()). */
+    simple_mtx_t nc_lock;
+    struct list_head nc_bos;
++
++   /* Freed kbase_kmod_bo wrappers available for reuse. Only the host-side
++    * struct is cached; the GPU allocation itself still goes through the
++    * kernel on every create/destroy. */
++   simple_mtx_t bo_cache_lock;
++   struct list_head bo_cache;
++   uint32_t bo_cache_count;
+ };
+ 
+ struct kbase_kmod_vm {
+@@ -276,6 +283,9 @@ struct kbase_kmod_bo {
+    /* On kbase_kmod_dev::nc_bos (nc_link valid). */
+    bool nc_listed;
+    struct list_head nc_link;
++
++   /* On kbase_kmod_dev::bo_cache while the wrapper is unused. */
++   struct list_head cache_link;
+ };
+ 
+ bool
+@@ -1683,6 +1693,8 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
+    simple_mtx_init(&kbase_dev->kcpu_export.lock, mtx_plain);
+    simple_mtx_init(&kbase_dev->nc_lock, mtx_plain);
+    list_inithead(&kbase_dev->nc_bos);
++   simple_mtx_init(&kbase_dev->bo_cache_lock, mtx_plain);
++   list_inithead(&kbase_dev->bo_cache);
+    if (!is_csf) {
+       kbase_dev->atom_stride = atom_stride;
+       kbase_dev->atom_seq_nr = atom_seq_nr;
+@@ -1836,6 +1848,15 @@ kbase_kmod_dev_destroy(struct pan_kmod_dev *dev)
+    simple_mtx_destroy(&kbase_dev->kcpu_export.lock);
+    simple_mtx_destroy(&kbase_dev->nc_lock);
+ 
++   while (!list_is_empty(&kbase_dev->bo_cache)) {
++      struct kbase_kmod_bo *bo =
++         list_first_entry(&kbase_dev->bo_cache, struct kbase_kmod_bo,
++                          cache_link);
++      list_del(&bo->cache_link);
++      pan_kmod_dev_free(dev, bo);
++   }
++   simple_mtx_destroy(&kbase_dev->bo_cache_lock);
++
+    if (!kbase_dev->is_csf) {
+       simple_mtx_destroy(&kbase_dev->atoms_read_lock);
+       simple_mtx_destroy(&kbase_dev->atoms_lock);
+@@ -1924,6 +1945,54 @@ to_kbase_mem_flags(uint32_t kmod_flags)
+    return flags;
+ }
+ 
++#define KBASE_BO_CACHE_MAX 64
++
++static struct kbase_kmod_bo *
++kbase_kmod_bo_wrapper_alloc(struct pan_kmod_dev *dev)
++{
++   struct kbase_kmod_dev *kbase_dev =
++      container_of(dev, struct kbase_kmod_dev, base);
++   struct kbase_kmod_bo *bo = NULL;
++
++   simple_mtx_lock(&kbase_dev->bo_cache_lock);
++   if (!list_is_empty(&kbase_dev->bo_cache)) {
++      bo = list_first_entry(&kbase_dev->bo_cache, struct kbase_kmod_bo,
++                            cache_link);
++      list_del(&bo->cache_link);
++      kbase_dev->bo_cache_count--;
++   }
++   simple_mtx_unlock(&kbase_dev->bo_cache_lock);
++
++   if (!bo)
++      bo = pan_kmod_dev_alloc(dev, sizeof(*bo));
++
++   /* A reused wrapper still holds the fields of the previous BO. */
++   if (bo)
++      memset(bo, 0, sizeof(*bo));
++
++   return bo;
++}
++
++static void
++kbase_kmod_bo_wrapper_free(struct pan_kmod_dev *dev,
++                           struct kbase_kmod_bo *bo)
++{
++   struct kbase_kmod_dev *kbase_dev =
++      container_of(dev, struct kbase_kmod_dev, base);
++   bool pooled = false;
++
++   simple_mtx_lock(&kbase_dev->bo_cache_lock);
++   if (kbase_dev->bo_cache_count < KBASE_BO_CACHE_MAX) {
++      kbase_dev->bo_cache_count++;
++      list_addtail(&bo->cache_link, &kbase_dev->bo_cache);
++      pooled = true;
++   }
++   simple_mtx_unlock(&kbase_dev->bo_cache_lock);
++
++   if (!pooled)
++      pan_kmod_dev_free(dev, bo);
++}
++
+ struct pan_kmod_bo *
+ kbase_kmod_bo_import_host(struct pan_kmod_dev *dev, void *host_ptr,
+                           uint64_t size)
+@@ -1938,7 +2007,7 @@ kbase_kmod_bo_import_host(struct pan_kmod_dev *dev, void *host_ptr,
+    }
+ 
+    struct kbase_kmod_bo *kbase_bo =
+-      pan_kmod_dev_alloc(dev, sizeof(*kbase_bo));
++      kbase_kmod_bo_wrapper_alloc(dev);
+    if (!kbase_bo)
+       return NULL;
+    kbase_bo->dmabuf_fd = -1;
+@@ -1959,7 +2028,7 @@ kbase_kmod_bo_import_host(struct pan_kmod_dev *dev, void *host_ptr,
+ 
+    if (ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT, &req)) {
+       mesa_loge("kbase: host memory import failed: %s", strerror(errno));
+-      pan_kmod_dev_free(dev, kbase_bo);
++      kbase_kmod_bo_wrapper_free(dev, kbase_bo);
+       return NULL;
+    }
+ 
+@@ -1976,7 +2045,7 @@ kbase_kmod_bo_import_host(struct pan_kmod_dev *dev, void *host_ptr,
+          mesa_loge("kbase: host memory GPU mmap failed: %s", strerror(errno));
+          struct kbase_ioctl_mem_free free_req = { .gpu_addr = req.out.gpu_va };
+          ioctl(dev->fd, KBASE_IOCTL_MEM_FREE, &free_req);
+-         pan_kmod_dev_free(dev, kbase_bo);
++         kbase_kmod_bo_wrapper_free(dev, kbase_bo);
+          return NULL;
+       }
+       kbase_bo->gpu_va = (uintptr_t)kbase_bo->gpu_mapping;
+@@ -2003,7 +2072,7 @@ kbase_kmod_import_dmabuf(struct pan_kmod_dev *dev,
+       container_of(dev, struct kbase_kmod_dev, base);
+    const uint64_t page_size = kbase_kmod_page_size();
+    struct kbase_kmod_bo *kbase_bo =
+-      pan_kmod_dev_alloc(dev, sizeof(*kbase_bo));
++      kbase_kmod_bo_wrapper_alloc(dev);
+    if (!kbase_bo)
+       return NULL;
+ 
+@@ -2196,7 +2265,7 @@ err_unmap_gpu:
+ err_close_dmabuf:
+    close(kbase_bo->dmabuf_fd);
+ err_free_bo:
+-   pan_kmod_dev_free(dev, kbase_bo);
++   kbase_kmod_bo_wrapper_free(dev, kbase_bo);
+    return NULL;
+ }
+ 
+@@ -2252,7 +2321,7 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
+    uint64_t va_pages = (size + page_size - 1) / page_size;
+ 
+    struct kbase_kmod_bo *kbase_bo =
+-      pan_kmod_dev_alloc(dev, sizeof(*kbase_bo));
++      kbase_kmod_bo_wrapper_alloc(dev);
+    if (!kbase_bo) {
+       mesa_loge("kbase: failed to allocate kbase_kmod_bo");
+       return NULL;
+@@ -2423,7 +2492,7 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
+    return &kbase_bo->base;
+ 
+ err_free_bo:
+-   pan_kmod_dev_free(dev, kbase_bo);
++   kbase_kmod_bo_wrapper_free(dev, kbase_bo);
+    return NULL;
+ }
+ 
+@@ -2463,7 +2532,7 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
+    if (kbase_bo->dmabuf_fd >= 0)
+       close(kbase_bo->dmabuf_fd);
+ 
+-   pan_kmod_dev_free(bo->dev, kbase_bo);
++   kbase_kmod_bo_wrapper_free(bo->dev, kbase_bo);
+ }
+ 
+ /*
