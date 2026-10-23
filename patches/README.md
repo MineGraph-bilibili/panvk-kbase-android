@@ -26,6 +26,8 @@ Directories:
   The G52 lesson: enabling Android WSI must not select the HAL-only symbol
   scheme and hide the ICD entry points.
 - `wsi/` — swapchain/acquire/present/resize, acquire-present sync.
+- `perf/` — performance patches on top of the functional families, applied
+  last in numeric order (currently 001-006).
 
 Rules:
 
